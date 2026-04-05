@@ -1,379 +1,302 @@
-# Jarvis — Personal Agent: Build Plan
+# Jarvis — Personal Agent: Build Plan (v2)
 
-## What We're Building
+## Addressing Architecture Concerns
 
-A Jarvis-like personal assistant that:
-- Listens in the background via voice ("Джарвис, ...") or Telegram
-- Transcribes speech → detects intent → dispatches to an agent
-- Agent thinks, calls tools (browser, terminal, filesystem) via MCP
-- Composes a spoken response via TTS and plays it back
-- Everything runs in Docker Compose, modular and testable
+### 1. Agent is CLIENT-side, not server-side
+The PRD explicitly says: *"по идее он должен быть на стороне клиента (то есть на моей стороне)"*.
+The agent must run on the user's desktop because it needs to:
+- Open the user's browser
+- Control the desktop (keyboard, mouse, windows)
+- Run commands in the user's terminal
+- Access local files
+
+**Server-side** = only stateless, compute-heavy services (ASR, DB for persistence)  
+**Client-side** = everything with agency (reasoning, tool execution, audio I/O)
+
+### 2. Build on openclaw, not from scratch
+openclaw (running on this machine) already provides:
+- ✅ **Telegram bot** — full implementation via grammy, multi-account, voice messages, streaming replies
+- ✅ **TTS** — abstracted providers: ElevenLabs, OpenAI TTS, Edge TTS; streaming, format selection
+- ✅ **Session management** — session store, context window management, message history
+- ✅ **Memory** — QMD vector embeddings, semantic search, MCP bridge
+- ✅ **LLM provider abstraction** — OpenAI, Anthropic, Google, OpenRouter, local models
+- ✅ **Plugin/channel system** — adapter pattern, registry, config-driven
+- ✅ **Daemon pattern** — systemd/launchd/schtasks lifecycle management
+- ✅ **Config system** — YAML, centralised, validated with Zod
+
+**We add**: A **voice channel plugin** for openclaw + a standalone **ASR service**.
 
 ---
 
-## Architecture
+## Revised Architecture
 
 ```
-┌─────────────────── CLIENT (desktop) ────────────────────────┐
-│                                                              │
-│  Microphone                                                  │
-│      │                                                       │
-│      ▼                                                       │
-│  [openWakeWord]  ─── detects "Jarvis" ──►  [ASR Client]     │
-│                                                │             │
-│                                          streams audio        │
-│                                                │             │
-└────────────────────────────────────────────────│─────────────┘
-                                                 │  WebSocket
-┌─────────────────── SERVER (docker-compose) ────▼─────────────┐
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  asr-service  (faster-whisper + silero-vad)           │    │
-│  │  POST /transcribe  WS /stream                         │    │
-│  └───────────────────────┬──────────────────────────────┘    │
-│                           │ writes chunks                     │
-│                           ▼                                   │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  PostgreSQL                                            │  │
-│  │  • asr_chunks   • messages   • sessions  • events     │  │
-│  └───────┬──────────────────────────────────────┬────────┘  │
-│           │ LISTEN/NOTIFY                        │           │
-│           ▼                                      │           │
-│  ┌─────────────────────┐              ┌──────────▼─────────┐ │
-│  │  intent-service     │              │  memory-service    │ │
-│  │  reads chunks,      │              │  stores & retrieves│ │
-│  │  LLM classifies     │              │  interaction hist. │ │
-│  │  → posts to         │              └────────────────────┘ │
-│  │    message queue    │                                     │
-│  └──────────┬──────────┘                                     │
-│             │                                                 │
-│             ▼                                                 │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  agent-service  (client-side, MCP + Claude API)       │    │
-│  │  • loads message from queue                           │    │
-│  │  • reasons + calls MCP tools                          │    │
-│  │  • writes response to message queue                   │    │
-│  │                                                       │    │
-│  │  MCP Servers (stdio):                                 │    │
-│  │    playwright-mcp    (browser)                        │    │
-│  │    desktop-commander (terminal + filesystem)          │    │
-│  │    filesystem-mcp    (Anthropic official)             │    │
-│  └──────────────────────┬────────────────────────────────┘   │
-│                          │                                    │
-│                          ▼                                    │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │  response-composer                                     │   │
-│  │  reads text responses → calls TTS → sends audio back  │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                                                               │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │  tts-service  (Piper TTS — CPU; Coqui XTTS — GPU)     │   │
-│  │  POST /synthesize   streaming chunks                   │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                                                               │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │  telegram-bot  (aiogram)                               │   │
-│  │  receives text + voice → feeds into message queue     │   │
-│  │  plays back TTS audio or sends text replies            │   │
-│  └───────────────────────────────────────────────────────┘   │
-│                                                               │
-│  ┌───────────────────────────────────────────────────────┐   │
-│  │  telemetry  (future)                                   │   │
-│  │  Prometheus + Grafana                                  │   │
-│  │  metrics: cost, requests/day, ASR chunks, latency      │   │
-│  └───────────────────────────────────────────────────────┘   │
-└───────────────────────────────────────────────────────────────┘
+╔══════════════════════ USER'S DESKTOP (CLIENT) ══════════════════════╗
+║                                                                      ║
+║  ┌─────────────────────────────────────────────────────────────┐    ║
+║  │               openclaw daemon  (already exists)              │    ║
+║  │                                                              │    ║
+║  │  ┌──────────────────┐   ┌──────────────────────────────┐   │    ║
+║  │  │  Telegram channel│   │  Voice channel plugin (NEW)   │   │    ║
+║  │  │  (already works) │   │                              │   │    ║
+║  │  └──────────────────┘   │  wakeword.py                 │   │    ║
+║  │                         │    ↓ "Jarvis"                 │   │    ║
+║  │  ┌──────────────────┐   │  mic_streamer.py             │   │    ║
+║  │  │  TTS provider    │   │    ↓ WebSocket chunks         │   │    ║
+║  │  │  (already works) │◄──│  ASR client                  │   │    ║
+║  │  └──────────────────┘   │    ↓ transcript               │   │    ║
+║  │                         │  intent_filter.py             │   │    ║
+║  │  ┌──────────────────┐   │    ↓ confirmed request        │   │    ║
+║  │  │  Agent loop      │◄──│  → openclaw message queue     │   │    ║
+║  │  │  (openclaw core) │   └──────────────────────────────┘   │    ║
+║  │  │                  │                                        │    ║
+║  │  │  MCP clients:    │                                        │    ║
+║  │  │  ┌────────────┐  │                                        │    ║
+║  │  │  │ playwright │  │  ← controls YOUR browser               │    ║
+║  │  │  │  -mcp      │  │                                        │    ║
+║  │  │  ├────────────┤  │                                        │    ║
+║  │  │  │ desktop-   │  │  ← controls YOUR terminal/files        │    ║
+║  │  │  │ commander  │  │                                        │    ║
+║  │  │  ├────────────┤  │                                        │    ║
+║  │  │  │ filesystem │  │  ← reads/writes YOUR files             │    ║
+║  │  │  └────────────┘  │                                        │    ║
+║  │  └──────────────────┘                                        │    ║
+║  └─────────────────────────────────────────────────────────────┘    ║
+║                          │  WebSocket                               ║
+╚══════════════════════════│══════════════════════════════════════════╝
+                           │
+╔══════════════════════ SERVER (Docker Compose) ═══════════════════════╗
+║                           │                                          ║
+║  ┌────────────────────────▼──────────────────────────────────────┐  ║
+║  │  asr-service                                                  │  ║
+║  │  faster-whisper (whisper-small / large-v3)                    │  ║
+║  │  + silero-vad v6                                              │  ║
+║  │  FastAPI  WS /stream   POST /transcribe                       │  ║
+║  └────────────────────────┬──────────────────────────────────────┘  ║
+║                            │ writes chunks                           ║
+║  ┌─────────────────────────▼─────────────────────────────────────┐  ║
+║  │  PostgreSQL                                                    │  ║
+║  │  • asr_chunks  (transcription log)                            │  ║
+║  │  • interaction_history  (for fine-tuning later)               │  ║
+║  └───────────────────────────────────────────────────────────────┘  ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
 ```
+
+**Key difference from v1:**
+- Agent runs on **client** inside openclaw — has direct access to desktop MCP tools
+- Server only runs ASR (compute-heavy) and DB (persistence)
+- Telegram is already fully working via openclaw — **zero new code needed there**
+- TTS is already working via openclaw — **zero new code needed there**
+- Response playback: openclaw handles TTS audio, client plays it via existing sounddevice/speaker
+
+---
+
+## What openclaw Already Gives Us (free)
+
+| Feature | openclaw component | Status |
+|---|---|---|
+| Telegram bot | `src/telegram/` (grammy) | ✅ Running now |
+| TTS playback | `src/tts/` (ElevenLabs/OpenAI/Edge) | ✅ Working |
+| LLM calls | `src/providers/` (OpenRouter, Anthropic, etc.) | ✅ Working |
+| Session history | `src/sessions/` | ✅ Working |
+| Vector memory | `src/memory/` (QMD) | ✅ Working |
+| Config system | YAML + Zod validation | ✅ Working |
+| Daemon lifecycle | `src/daemon/` (systemd/launchd) | ✅ Working |
+| MCP tool integration | via `mcporter` bridge | ✅ Working |
 
 ---
 
 ## Technology Stack
 
-### ASR Service
-| Concern | Choice | Reason |
+### ASR Service (Docker, server-side)
+| Concern | Choice | Why |
 |---|---|---|
-| Transcription engine | **faster-whisper** (SYSTRAN) | 4× faster than OpenAI Whisper, same accuracy, INT8 quantization, CPU+GPU |
-| Model | `whisper-small` (CPU) / `whisper-large-v3` (GPU) | Best speed/accuracy tradeoff for real-time |
+| Transcription | **faster-whisper** | 4× faster than stock Whisper, INT8, CPU+GPU |
+| Model | `whisper-small` (CPU) → `large-v3` (GPU) | Best real-time speed/accuracy |
 | VAD | **silero-vad v6** | Built into faster-whisper, 4× fewer errors than webrtcvad |
-| Streaming | **whisper-streaming** (UFAL) | 3.3s latency on long-form, local agreement policy |
-| Service layer | **FastAPI + WebSocket** | Real-time chunk streaming, easy to test |
-| Wake word | **openWakeWord** | Open-source, MIT, <0.5 false-accepts/hour, trains custom "Jarvis" |
-| Mic capture (client) | **sounddevice** | NumPy-native, cross-platform, lowest latency |
-| Docker base | `python:3.12-slim` + ctranslate2 wheels | Minimal image, fast startup |
+| Streaming | **whisper-streaming** (UFAL) chunking strategy | 3.3s latency, local agreement policy |
+| API | **FastAPI + WebSocket** | Real-time chunk streaming |
+| Docker base | `python:3.12-slim` + ctranslate2 | Small image |
 
-### Message Bus & Storage
-| Concern | Choice | Reason |
+### Voice Channel Plugin (client-side, extends openclaw)
+| Concern | Choice | Why |
 |---|---|---|
-| Primary DB | **PostgreSQL 16** | ASR chunks + messages + history + LISTEN/NOTIFY for events |
-| Message queue | **PostgreSQL LISTEN/NOTIFY** via `asyncpg` | No extra service, sufficient for personal scale |
-| Heavy queue (future) | **Redis Streams** | If multi-user or high concurrency needed |
-| Migrations | **Alembic** | Standard Python ORM migration tool |
+| Wake word | **openWakeWord** | MIT, <0.5 false-accepts/hr, custom "Jarvis" training |
+| Mic capture | **sounddevice** | NumPy-native, cross-platform, lowest latency |
+| Intent filter | **Claude Haiku** (OpenRouter, already in openclaw) | Cheap, fast yes/no classification |
+| Language | **TypeScript** (plugin) + **Python** (ASR client) | Match openclaw's codebase |
 
-### Intent Service
-| Concern | Choice | Reason |
+### Agent + MCP tools (client-side, via openclaw)
+| Concern | Choice | Why |
 |---|---|---|
-| LLM for classification | **Claude Haiku 4.5** (via OpenRouter) | Cheapest, fast, sufficient for yes/no intent detection |
-| Future replacement | Local small LLM (e.g., Qwen-2.5-0.5B via Ollama) | Zero cost, private |
-
-### Agent Service
-| Concern | Choice | Reason |
-|---|---|---|
-| LLM | **Claude Sonnet 4.6** (via OpenRouter) | Best reasoning for complex desktop tasks |
-| Tool protocol | **MCP** (Model Context Protocol) | Native Anthropic support, extensible |
+| LLM | **Claude Sonnet 4.6** (already in openclaw config) | Best reasoning for desktop tasks |
 | Browser | **microsoft/playwright-mcp** | Accessibility-tree based, no vision needed |
-| Terminal / FS | **DesktopCommanderMCP** | Terminal + filesystem in one, active maintenance |
-| MCP client | **Anthropic Python SDK** + `mcp` package | Direct, no framework overhead |
-| Desktop fallback | **pyautogui** | Cross-platform, covers gaps MCP doesn't |
+| Terminal/FS | **DesktopCommanderMCP** | Terminal + filesystem in one MCP server |
+| Desktop fallback | **pyautogui** | Cross-platform, covers MCP gaps |
+| Protocol | **MCP** via openclaw's mcporter | Already integrated |
 
-### TTS & Playback
-| Concern | Choice | Reason |
+### Storage (server-side Docker)
+| Concern | Choice | Why |
 |---|---|---|
-| TTS engine (CPU) | **Piper TTS** (rhasspy/piper) | <200ms latency, ONNX, Docker image available |
-| TTS engine (GPU) | **Coqui XTTS-v2** | High quality, voice cloning, streaming |
-| Future | **Voxtral** (Mistral) | Beats ElevenLabs, open weights |
-| Google/ElevenLabs | Via config flag | Cloud fallback for quality |
-| Playback | **sounddevice** | Streaming NumPy audio, cross-platform |
-
-### Telegram Bot
-| Concern | Choice | Reason |
-|---|---|---|
-| Framework | **aiogram v3** | Async-first, modern, best for high-concurrency |
-| Transport | Polling (dev) → Webhook (prod) | Simple start, scalable finish |
-| Voice input | Download OGG → convert to WAV → ASR | Standard Telegram voice flow |
-
-### Infrastructure
-| Concern | Choice | Reason |
-|---|---|---|
-| Orchestration | **Docker Compose** | Simple, single-machine, easy to extend |
-| Config | **YAML configs** in `config/` | Readable, centralised, env var overrides |
-| Testing | **pytest + testcontainers** | Real DB in tests, no mocking |
-| Telemetry (future) | **Prometheus + Grafana** | Standard stack, many dashboards available |
+| Primary DB | **PostgreSQL 16** | ASR chunks + history + LISTEN/NOTIFY |
+| Queue | **PostgreSQL LISTEN/NOTIFY** | No extra service, sufficient for personal scale |
+| Migrations | **Alembic** | Standard Python migration tool |
 
 ---
 
-## Project File Structure
+## Project Structure
 
 ```
-jarvis/
-├── config/
-│   ├── default.yaml          # All defaults (model sizes, ports, thresholds)
-│   └── local.yaml            # User overrides (gitignored)
+jarvis/                          (this repo)
 │
 ├── services/
-│   ├── asr/                  # ASR microservice
-│   │   ├── Dockerfile
-│   │   ├── main.py           # FastAPI + WebSocket
-│   │   ├── transcriber.py    # faster-whisper + silero-vad
-│   │   └── tests/
-│   │
-│   ├── intent/               # Intent detection microservice
-│   │   ├── Dockerfile
-│   │   ├── main.py           # Reads ASR chunks, classifies, enqueues
-│   │   ├── classifier.py     # LLM prompt + response parsing
-│   │   └── tests/
-│   │
-│   ├── agent/                # Main agent (client-side)
-│   │   ├── Dockerfile
-│   │   ├── main.py           # Queue reader + agent loop
-│   │   ├── mcp_client.py     # MCP server connections
-│   │   ├── tools.py          # MCP tool schemas
-│   │   └── tests/
-│   │
-│   ├── tts/                  # TTS microservice
-│   │   ├── Dockerfile
-│   │   ├── main.py           # FastAPI /synthesize endpoint
-│   │   └── tests/
-│   │
-│   ├── response_composer/    # Reads agent output → calls TTS → sends audio
-│   │   ├── Dockerfile
-│   │   ├── main.py
-│   │   └── tests/
-│   │
-│   ├── telegram_bot/         # Telegram interface
-│   │   ├── Dockerfile
-│   │   ├── main.py           # aiogram bot
-│   │   ├── handlers.py       # voice + text message handlers
-│   │   └── tests/
-│   │
-│   └── memory/               # Interaction history service
+│   └── asr/                     ← NEW: Docker microservice
 │       ├── Dockerfile
-│       ├── main.py
+│       ├── main.py              FastAPI + WebSocket
+│       ├── transcriber.py       faster-whisper + silero-vad
+│       ├── chunker.py           whisper-streaming chunking logic
 │       └── tests/
 │
-├── client/                   # Desktop client (runs on user's machine)
-│   ├── wakeword.py           # openWakeWord listener
-│   ├── mic_streamer.py       # sounddevice → WebSocket → ASR
-│   ├── audio_player.py       # sounddevice playback
-│   └── main.py               # Ties it all together
+├── client/                      ← NEW: runs on user's desktop
+│   ├── wakeword.py              openWakeWord "Jarvis" detector
+│   ├── mic_streamer.py          sounddevice → WebSocket → ASR
+│   ├── intent_filter.py         LLM: "is this a command?"
+│   └── main.py                  orchestrates the above
+│
+├── openclaw-plugin/             ← NEW: voice channel plugin for openclaw
+│   ├── package.json
+│   ├── src/
+│   │   ├── index.ts             ChannelPlugin registration
+│   │   ├── setup.ts             config setup adapter
+│   │   ├── messaging.ts         inbound: receives ASR transcripts as messages
+│   │   └── outbound.ts          outbound: TTS via openclaw's existing tts module
+│   └── README.md
 │
 ├── db/
-│   ├── migrations/           # Alembic migrations
-│   └── schema.sql            # Reference schema
+│   ├── migrations/              Alembic migrations
+│   └── schema.sql               Reference schema
 │
-├── docker-compose.yml        # Full stack
-├── docker-compose.dev.yml    # Dev overrides (hot reload, exposed ports)
+├── docker-compose.yml           asr + postgres services only
+├── config/
+│   └── default.yaml             centralised config (read by both client + server)
 └── Makefile
 ```
 
 ---
 
-## Build Plan — Ordered Steps
+## Build Phases
 
-### Phase 1: Foundation (DB + ASR service) ← START HERE
-**Goal:** Audio in → transcription chunks in DB, service running in Docker
+### Phase 1: ASR Service ← START HERE
+**Goal:** Audio in via WebSocket → transcription chunks out
 
-1. **DB schema** — PostgreSQL with tables: `sessions`, `asr_chunks`, `messages`, `events`
-2. **ASR service** — faster-whisper + silero-vad, FastAPI WebSocket endpoint
-3. **ASR tests** — POST a WAV file, assert chunks in DB
-4. **Docker Compose** — `postgres` + `asr` services, health checks
-5. **Desktop client stub** — `mic_streamer.py` captures mic → streams to ASR WS
+1. `services/asr/transcriber.py` — faster-whisper + silero-vad, streaming chunk output
+2. `services/asr/main.py` — FastAPI: `WS /stream` (real-time), `POST /transcribe` (file)
+3. `services/asr/Dockerfile` — python:3.12-slim, ctranslate2, model pre-downloaded
+4. `docker-compose.yml` — `asr` + `postgres` services with health checks
+5. Tests — POST a WAV file → assert transcript returned
 
 **Resources:**
 - https://github.com/SYSTRAN/faster-whisper
-- https://github.com/snakers4/silero-vad
-- https://github.com/ufal/whisper_streaming (reference for chunking strategy)
-- HuggingFace: `openai/whisper-small` weights
+- `openai/whisper-small` from HuggingFace
+- https://github.com/ufal/whisper_streaming (chunking strategy reference)
 
 ---
 
-### Phase 2: Intent Detection
-**Goal:** Chunks → LLM decides if it's a command → message in queue
+### Phase 2: Desktop Client (voice capture)
+**Goal:** Say "Jarvis" → audio streamed to ASR → transcript returned
 
-6. **Intent service** — reads new `asr_chunks` via `LISTEN/NOTIFY`, assembles text window
-7. **LLM classifier** — prompt: *"Does this transcript contain an actionable request? Answer JSON: {is_request: bool, query: str}"*
-8. **Message queue** — confirmed requests written to `messages` table with `status=pending`
-9. **Intent tests** — assert "найди отель" → `is_request=true`, "ммм" → `is_request=false`
-
-**Resources:**
-- Anthropic Claude Haiku via OpenRouter (cheap, fast)
-- asyncpg LISTEN/NOTIFY pattern
-
----
-
-### Phase 3: Agent + MCP tools
-**Goal:** Pending message → agent reasons + executes → result in queue
-
-10. **Agent service** — polls `messages` for `status=pending`, runs agent loop
-11. **MCP client** — connects to: filesystem MCP, playwright-mcp, desktop-commander
-12. **Tool integration** — browser search, terminal exec, file ops
-13. **History dump** — full action trace written to `messages` table (for fine-tuning)
-14. **Agent tests** — mock MCP servers, assert correct tool calls
-
-**Resources:**
-- https://github.com/microsoft/playwright-mcp
-- https://github.com/wonderwhy-er/DesktopCommanderMCP
-- https://github.com/modelcontextprotocol/python-sdk
-- Anthropic `mcp` Python package
-
----
-
-### Phase 4: TTS + Response Composer
-**Goal:** Agent text response → spoken audio → played on desktop
-
-15. **TTS service** — Piper TTS in Docker, `/synthesize` endpoint, streaming chunks
-16. **Response composer** — reads `messages` with `status=needs_speech`, calls TTS, streams audio
-17. **Audio player (client)** — `sounddevice` plays back streamed WAV chunks
-18. **TTS tests** — assert WAV bytes returned for text input
-
-**Resources:**
-- https://github.com/rhasspy/piper
-- `linuxserver/piper` Docker image
-- sounddevice streaming docs
-
----
-
-### Phase 5: Wake Word + Desktop Client
-**Goal:** Say "Jarvis" → whole pipeline activates end-to-end
-
-19. **Wake word listener** — openWakeWord detecting "Jarvis" trigger
-20. **Desktop client** — `main.py` ties together wake word + mic streamer + audio player
-21. **E2E test** — WAV file with "Jarvis, what time is it" → agent response played back
+6. `client/wakeword.py` — openWakeWord detector, activates mic on trigger
+7. `client/mic_streamer.py` — sounddevice capture → WebSocket stream to ASR service
+8. `client/intent_filter.py` — sliding window of chunks → LLM: is this a command?
+9. `client/main.py` — ties it together, pushes confirmed requests to openclaw
 
 **Resources:**
 - https://github.com/dscripka/openWakeWord
-- Custom wake word training if needed
+- sounddevice docs
 
 ---
 
-### Phase 6: Telegram Bot
-**Goal:** Same pipeline accessible via Telegram text + voice
+### Phase 3: openclaw Voice Channel Plugin
+**Goal:** Voice request appears in openclaw as a regular message → agent processes it → TTS response played back
 
-22. **Telegram bot** — aiogram v3, polling mode initially
-23. **Voice handler** — OGG → WAV → ASR endpoint → same intent + agent flow
-24. **Text handler** — direct to message queue, skip ASR
-25. **Response handler** — TTS audio sent as voice message OR text reply
-26. **Config** — bot token + channel selection in `config/default.yaml`
+10. `openclaw-plugin/src/index.ts` — register voice as a `ChannelPlugin`
+11. `openclaw-plugin/src/messaging.ts` — receive inbound from `client/intent_filter.py`
+12. `openclaw-plugin/src/outbound.ts` — wrap openclaw's existing TTS system for playback
+13. Wire MCP servers: playwright-mcp + desktop-commander into openclaw config
 
 **Resources:**
-- https://github.com/aiogram/aiogram
-- Telegram Bot API voice message handling
+- openclaw `src/channels/` — channel plugin interface
+- openclaw `src/tts/` — existing TTS, reuse as-is
+- https://github.com/microsoft/playwright-mcp
+- https://github.com/wonderwhy-er/DesktopCommanderMCP
 
 ---
 
-### Phase 7: Telemetry (future)
-27. **Prometheus metrics** — cost counter, request counter, ASR chunk counter, latency histograms
-28. **Grafana dashboard** — pre-built JSON dashboard in `monitoring/`
-29. **Alert rules** — daily cost threshold
+### Phase 4: Interaction History
+**Goal:** All agent actions stored in PostgreSQL for future fine-tuning
+
+14. `db/schema.sql` — `sessions`, `asr_chunks`, `messages`, `agent_actions` tables
+15. Alembic migrations
+16. History writer — after each agent turn, dump full trace to DB
 
 ---
 
-## Key Configuration File (preview)
+### Phase 5: Telemetry (future)
+17. Prometheus metrics: cost, request count, ASR chunks/day, latency
+18. Grafana dashboard JSON
+19. Alert rules (daily cost threshold)
+
+---
+
+## Configuration (centralised, single file)
 
 ```yaml
 # config/default.yaml
+
 asr:
-  model: openai/whisper-small          # HuggingFace model ID
-  device: cpu                          # cpu | cuda
-  language: ru                         # primary language
+  url: ws://localhost:8765/stream     # ASR service WebSocket
+  model: openai/whisper-small         # HuggingFace model ID
+  device: cpu                         # cpu | cuda
+  language: ru                        # primary language
   vad_threshold: 0.5
   chunk_duration_ms: 500
 
+wakeword:
+  model: jarvis                       # openWakeWord model name
+  threshold: 0.5
+  activation_phrase: "Джарвис"
+
 intent:
-  llm: anthropic/claude-haiku-4.5      # via OpenRouter
-  window_seconds: 10                   # sliding window of chunks to classify
-  confidence_threshold: 0.8
+  window_seconds: 10                  # sliding window for intent classification
+  llm: anthropic/claude-haiku-4.5    # cheap + fast for yes/no
 
-agent:
-  llm: anthropic/claude-sonnet-4.6
-  mcp_servers:
-    - name: filesystem
-      command: npx
-      args: ["@modelcontextprotocol/server-filesystem", "/home"]
-    - name: playwright
-      command: npx
-      args: ["@playwright/mcp@latest"]
-    - name: desktop-commander
-      command: npx
-      args: ["@wonderwhy-er/desktop-commander"]
-
-tts:
-  engine: piper                        # piper | coqui | google | elevenlabs
-  voice: en_US-lessac-medium          # Piper voice model
-  streaming: true
-
-telegram:
-  enabled: true
-  token: ""                            # set via env TELEGRAM_BOT_TOKEN
-  polling: true                        # false = webhook
-
-memory:
-  dump_history: true                   # save all interactions for fine-tuning
+# agent config lives in openclaw's existing config
+# (openclaw already handles LLM, MCP, TTS, Telegram)
 
 db:
-  url: postgresql://jarvis:jarvis@postgres:5432/jarvis
-  backup_enabled: true
-  backup_schedule: "0 3 * * *"        # daily at 3am
+  url: postgresql://jarvis:jarvis@localhost:5432/jarvis
+
+telegram:
+  # configured in openclaw's existing config (~/.openclaw/openclaw.json)
+  # no changes needed
 ```
 
 ---
 
-## Questions / Things Needed From You
+## Questions for You
 
-Before full development starts, please confirm:
+1. **GPU?** Does your desktop/server have a CUDA GPU?
+   - Yes → `whisper-large-v3` (highest accuracy) + Coqui XTTS for TTS
+   - No → `whisper-small` (good for Russian) + Piper TTS (CPU-native)
 
-1. **Hardware**: Do you have a CUDA GPU on the target machine? → determines Whisper model size and TTS choice
-2. **Language priority**: Russian-first or English-first? (Whisper handles both, but language config matters)
-3. **Wake word**: Should it be "Jarvis" or "Джарвис" (Russian pronunciation)?
-4. **Telegram bot token**: Already have one? (used in config, not committed)
-5. **OpenRouter budget**: Current key has access to Claude Haiku + Sonnet — confirm this is OK for development
-6. **Client OS**: Linux/Mac/Windows? (affects desktop automation tool choices)
+2. **Language:** Russian-first or English-first? (or both equally?)
+   - Affects VAD thresholds and Whisper language config
+
+3. **Wake word language:** "Jarvis" (English) or "Джарвис" (Russian pronunciation)?
+   - openWakeWord has English "hey jarvis" built-in; Russian needs custom training (1-2h)
+
+4. **Client OS:** Linux/Mac/Windows?
+   - Affects desktop automation: xdotool (Linux), AppleScript (Mac), pyautogui (all)
+
+5. **openclaw location:** Is the openclaw source at `/home/mle/openclaw` the same instance currently running? Can we modify it, or should the voice plugin be a separate npm package installed into it?
