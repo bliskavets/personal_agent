@@ -284,19 +284,16 @@ telegram:
 
 ---
 
-## Questions for You
+## Answered Configuration
 
-1. **GPU?** Does your desktop/server have a CUDA GPU?
-   - Yes → `whisper-large-v3` (highest accuracy) + Coqui XTTS for TTS
-   - No → `whisper-small` (good for Russian) + Piper TTS (CPU-native)
+| Question | Answer | Impact |
+|---|---|---|
+| GPU (server) | ✅ Yes, CUDA | `whisper-large-v3`, `float16`, CUDA Docker image |
+| Languages | Russian + English equally | Whisper auto-detect (`language=None`) |
+| Wake word | Both "Jarvis" + "Джарвис" | openWakeWord EN model + custom RU model |
+| Client OS | macOS Monterey, M1 Pro (ARM64) | sounddevice + CoreAudio; `say`/afplay for TTS |
+| Voice service | Standalone Python daemon | Not tied to openclaw; fork relevant parts freely |
 
-2. **Language:** Russian-first or English-first? (or both equally?)
-   - Affects VAD thresholds and Whisper language config
-
-3. **Wake word language:** "Jarvis" (English) or "Джарвис" (Russian pronunciation)?
-   - openWakeWord has English "hey jarvis" built-in; Russian needs custom training (1-2h)
-
-4. **Client OS:** Linux/Mac/Windows?
-   - Affects desktop automation: xdotool (Linux), AppleScript (Mac), pyautogui (all)
-
-5. **openclaw location:** Is the openclaw source at `/home/mle/openclaw` the same instance currently running? Can we modify it, or should the voice plugin be a separate npm package installed into it?
+**Voice service is standalone** — a pure Python daemon on macOS M1 that owns the full
+voice pipeline: wake word → ASR → LLM → TTS playback. No openclaw dependency required,
+though we can borrow config patterns and API keys from it.
