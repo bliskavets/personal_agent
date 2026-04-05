@@ -1,16 +1,107 @@
+################################################################################
+# docker-compose.yml — Jarvis Phase 1: ASR microservice stack
+#
+# Services
+# --------
+#   asr       FastAPI / faster-whisper (GPU) service
+#   postgres  PostgreSQL 16 — stores every transcription chunk
+#
+# Usage
+# -----
+#   cp .env.example .env          # fill in any overrides
+#   docker compose up --build     # start the full stack
+#   docker compose up --build asr # rebuild only the ASR service
+################################################################################
+
 version: "3.9"
 
-# docker-compose is used to run a single agent interactively.
-# For multi-agent orchestration use orchestrator.py directly.
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:          # durable PostgreSQL data
+  whisper_model_cache:    # persists downloaded model weights across rebuilds
 
+# ---------------------------------------------------------------------------
+# Shared networking
+# ---------------------------------------------------------------------------
+networks:
+  asr_net:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
 services:
-  agent:
-    build: .
-    image: personal-agent-worker
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL 16
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: asr_postgres
+    restart: unless-stopped
+    networks:
+      - asr_net
     environment:
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - CLAUDE_MODEL=${CLAUDE_MODEL:-anthropic/claude-sonnet-4.6}
-      - AGENT_ROLE=${AGENT_ROLE:-generalist}
+      POSTGRES_USER:     ${POSTGRES_USER:-asr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-asr}
+      POSTGRES_DB:       ${POSTGRES_DB:-asr}
     volumes:
-      - ./workspace:/workspace
-    command: "${AGENT_TASK:-What files are in the workspace?}"
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-asr} -d ${POSTGRES_DB:-asr}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # ASR Service (FastAPI + faster-whisper + Silero VAD)
+  # --------------------------------------------------------------------------
+  asr:
+    build:
+      context: ./services/asr
+      dockerfile: Dockerfile
+    container_name: asr_service
+    restart: unless-stopped
+    networks:
+      - asr_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-asr}:${POSTGRES_PASSWORD:-asr}@postgres:5432/${POSTGRES_DB:-asr}
+      # Whisper
+      WHISPER_MODEL:        ${WHISPER_MODEL:-large-v3}
+      WHISPER_DEVICE:       ${WHISPER_DEVICE:-cuda}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+      # Misc
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # Cache Whisper model weights so they survive container rebuilds
+      - whisper_model_cache:/root/.cache/huggingface
+    ports:
+      - "${ASR_PORT:-8000}:8000"
+    # NVIDIA GPU access (requires nvidia-container-toolkit on the host)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s    # allow time for model download on first start
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
