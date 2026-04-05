@@ -1,0 +1,16 @@
+version: "3.9"
+
+# docker-compose is used to run a single agent interactively.
+# For multi-agent orchestration use orchestrator.py directly.
+
+services:
+  agent:
+    build: .
+    image: personal-agent-worker
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-anthropic/claude-sonnet-4.6}
+      - AGENT_ROLE=${AGENT_ROLE:-generalist}
+    volumes:
+      - ./workspace:/workspace
+    command: "${AGENT_TASK:-What files are in the workspace?}"
